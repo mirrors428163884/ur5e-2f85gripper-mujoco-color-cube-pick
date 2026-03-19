@@ -1,0 +1,31 @@
+# 运动规划参数
+motion:
+  cartesian_velocity: 0.05    # 笛卡尔空间速度 (m/s)
+  cartesian_acceleration: 0.05 # 笛卡尔空间加速度 (m/s²)
+  max_joint_step: 0.05        # 最大关节步长 (rad)
+  tolerance: 0.002           # 位置容差 (m)
+  integration_dt: 1.0        # 积分时间步长
+  ik_damping: 0.0001         # 逆运动学阻尼系数
+
+# 仿真参数
+simulation:
+  dt: 0.002                  # 仿真时间步长 (s)
+  sleep_control: true        # 是否启用睡眠控制
+
+# 盒子参数
+boxes:
+  red: 0
+  green: 1  
+  blue: 2
+  random_range:
+    x: [-0.7, -0.4]
+    y: [-0.2, 0.2]
+    z: 0.03
+    rotation_z: [-0.785, 0.785]  # [-45°, 45°] in radians
+
+# 抓取参数
+grasping:
+  approach_height: 0.3       # 接近高度 (m)
+  grasp_height: 0.17         # 抓取高度 (m)
+  lift_height: 0.3          # 抬升高度 (m)
+  place_height: 0.20        # 放置高度 (m)
