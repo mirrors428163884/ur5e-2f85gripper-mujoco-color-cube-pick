@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import queue
+import copy
 
 # ================= 配置区域 =================
 DETECTION_MODE = 'color_only'
@@ -17,7 +18,6 @@ MODEL_PATH = './ur5e_robotiq2f85/scene.xml'
 VISION_OFFSET = np.array([0.0025, -0.0015, 0.0]) 
 
 # 【新增】放置释放高度阈值
-# 物体高度约 0.04，设为 0.06 确保在接触前一点点释放，或者刚好接触
 RELEASE_HEIGHT_THRESHOLD = 0.06 
 
 # 【新增】自由落体仿真持续时间 (秒)
@@ -40,29 +40,50 @@ class FrameBuffer:
             'pos': None,
             'euler_z': 0.0,
             'debug_img': None,
-            'pixel_coords': None
+            'pixel_coords': None,
+            'timestamp': 0.0
         }
         self.lock = threading.Lock()
         self.stop_flag = False
 
     def put_frame(self, cam_name, image_rgb):
+        if self.stop_flag:
+            return
         try:
-            if not self.queue.full():
-                self.queue.put((cam_name, image_rgb))
+            # 非阻塞放入，满则丢弃旧帧，保证实时性
+            if self.queue.full():
+                try:
+                    self.queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self.queue.put((cam_name, image_rgb.copy()), block=False)
         except queue.Full:
             pass
 
     def set_result(self, found, pos, euler_z, debug_img, pixel_coords=None):
         with self.lock:
+            # 深拷贝图像防止外部修改
+            img_copy = None
+            if debug_img is not None:
+                img_copy = debug_img.copy()
+            
             self.latest_result['found'] = found
             self.latest_result['pos'] = pos
             self.latest_result['euler_z'] = euler_z
-            self.latest_result['debug_img'] = debug_img
+            self.latest_result['debug_img'] = img_copy
             self.latest_result['pixel_coords'] = pixel_coords
+            self.latest_result['timestamp'] = time.time()
 
     def get_result(self):
         with self.lock:
-            return self.latest_result.copy()
+            # 返回副本
+            res = self.latest_result.copy()
+            if res['debug_img'] is not None:
+                res['debug_img'] = res['debug_img'].copy()
+            return res
+
+    def stop(self):
+        self.stop_flag = True
 
 frame_buffer = FrameBuffer()
 
@@ -102,6 +123,9 @@ class env_cam:
         self.ready = False
 
     def get_frame(self):
+        if self.model is None or self.data is None:
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            
         mujoco.mjv_updateScene(self.model, self.data, self.vopt, self.perturb, self.camera, mujoco.mjtCatBit.mjCAT_ALL, self.scene)
         viewport = mujoco.MjrRect(0, 0, self.width, self.height)
         mujoco.mjr_render(viewport, self.scene, self.context)
@@ -167,7 +191,10 @@ class env_cam:
 
     def close(self):
         if hasattr(self, '_window') and self._window:
-            glfw.destroy_window(self._window)
+            try:
+                glfw.destroy_window(self._window)
+            except:
+                pass
 
 class PickBoxEnv:
     def __init__(self):
@@ -339,7 +366,6 @@ class PickBoxEnv:
         
         t = cur_time - start_time
         if self.t3 == 0: 
-            # 如果规划距离为 0，直接返回完成
             return True, target_pos, target_euler
 
         if t < 0: t = 0 
@@ -352,7 +378,6 @@ class PickBoxEnv:
             deltaT = t - self.t2
             deltaD = self.d2 + self.v * deltaT - 0.5 * self.a * deltaT**2
         else:
-            # 时间超过总时间，视为完成
             return True, target_pos, target_euler
 
         ratio = deltaD / self.d if self.d > 1e-6 else 1.0
@@ -368,9 +393,6 @@ class PickBoxEnv:
         d = np.linalg.norm([dx, dy, dz])
         self.dx, self.dy, self.dz, self.d = dx, dy, dz, d
         
-        # 【调试】打印规划信息
-        # print(f"     [Plan Debug] Dist: {d:.4f}, Start: {start_pos}, End: {end_pos}")
-
         if d < 1e-6:
             self.t1 = self.t2 = self.t3 = 0
             return
@@ -398,9 +420,6 @@ class PickBoxEnv:
             self.t3 = 2*t1
             self.d1 = self.d2 = d/2
             self.d3 = d
-        
-        # 【调试】打印时间信息
-        # print(f"     [Plan Debug] T1: {self.t1:.2f}, T2: {self.t2:.2f}, T3: {self.t3:.2f}")
         
         self.need_plan = False
 
@@ -457,7 +476,7 @@ class PickBoxEnv:
             roll = np.arctan2(R[2, 1], R[2, 2])
         return np.array([roll, pitch, yaw])
 
-# ================= 视觉检测函数 (全局可用) =================
+# ================= 视觉检测函数 =================
 
 def get_blue_mask(hsv_img):
     lower_blue = np.array([90, 100, 100], dtype=np.uint8)
@@ -469,6 +488,9 @@ def get_blue_mask(hsv_img):
     return mask
 
 def process_visual_feedback(env, frame_rgb, cam_name):
+    if frame_rgb is None or frame_rgb.size == 0:
+        return None, False, None
+
     frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     hsv_img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     
@@ -511,6 +533,7 @@ def process_visual_feedback(env, frame_rgb, cam_name):
     return debug_img, found_local, (cx, cy)
 
 def detection_thread_func(env):
+    print("[Thread] Vision detection thread started.")
     while not frame_buffer.stop_flag:
         try:
             try:
@@ -523,7 +546,10 @@ def detection_thread_func(env):
                 
             process_visual_feedback(env, frame_rgb, cam_name)
         except Exception as e:
+            if not frame_buffer.stop_flag:
+                print(f"[Thread] Error in detection: {e}")
             time.sleep(0.01)
+    print("[Thread] Vision detection thread stopped.")
 
 # ================= 主程序 =================
 
@@ -549,8 +575,9 @@ if __name__ == "__main__":
                 viewer.sync()
                 for name, cam in env.cameras.items():
                     frame = cam.get_frame()
-                    test_img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    cv2.imshow(f"Vision: {name}", test_img)
+                    if frame.size > 0:
+                        test_img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        cv2.imshow(f"Vision: {name}", test_img)
                 glfw.poll_events()
                 cv2.waitKey(1)
 
@@ -579,6 +606,8 @@ if __name__ == "__main__":
                     
                     if result['found'] and result['pixel_coords'] and not detected:
                         cx, cy = result['pixel_coords']
+                        if 'cam_tip' not in env.cameras:
+                            continue
                         cam_tip_obj = env.cameras['cam_tip']
                         
                         possible_z_heights = [0.04] 
@@ -607,16 +636,16 @@ if __name__ == "__main__":
                 
                 elapsed = time.time() - step_start
                 if elapsed < env.dt:
-                    time.sleep(env.dt - elapsed)
+                    time.sleep(max(0, env.dt - elapsed))
 
             if not detected:
                 print("Detection failed.")
-                frame_buffer.stop_flag = True
+                frame_buffer.stop()
                 if detection_thread:
                     detection_thread.join(timeout=1.0)
                 sys.exit(0)
 
-            frame_buffer.stop_flag = True
+            frame_buffer.stop()
             if detection_thread:
                 detection_thread.join(timeout=1.0)
             print("Background detection thread stopped. Switching to main-loop visual feedback.")
@@ -625,16 +654,19 @@ if __name__ == "__main__":
             target_pos = final_target_pos_compensated
             target_euler_z = 0.0
             
+            # 状态机变量
             step = 0 
-            step_res = True 
+            step_completed = True  # 标记当前步骤是否已完成，允许进入下一步初始化
             start_pos = None
             start_rotm = None
             start_time = 0
             target = np.zeros(6)
             
+            # Step 4 专用变量
             release_triggered = False
             simulation_start_time = 0
             step4_loop_count = 0
+            step4_init_done = False
 
             while viewer.is_running():
                 step_start = time.time()
@@ -643,7 +675,8 @@ if __name__ == "__main__":
                 if 'cam_tip' in env.cameras:
                     frame_tip_raw = env.cameras['cam_tip'].get_frame()
                     debug_img_tip, _, _ = process_visual_feedback(env, frame_tip_raw, 'cam_tip')
-                    cv2.imshow(f"Vision: cam_tip", debug_img_tip)
+                    if debug_img_tip is not None:
+                        cv2.imshow(f"Vision: cam_tip", debug_img_tip)
                 
                 if 'cam_world' in env.cameras:
                     frame_world_raw = env.cameras['cam_world'].get_frame()
@@ -651,152 +684,186 @@ if __name__ == "__main__":
                     cv2.imshow(f"Vision: cam_world", frame_world_bgr)
                 # =============================================================
 
+                current_pose = env.get_current_pose()
+                current_time = env.data.time
+
                 # --- Step 0: 接近 ---
-                if step == 0 and step_res:
-                    print(f"  -> Step 0: Approach to {target_pos}")
-                    step = 1; step_res = False; env.need_plan = True
-                    current_pose = env.get_current_pose()
-                    start_pos, start_rotm = current_pose[0], current_pose[1]
-                    start_time = env.data.time
-                    target[:3] = target_pos + np.array([0.0, 0.0, env.GRASP_APPROACH_HEIGHT]) 
-                    target[3:] = [np.pi, 0.0, np.pi / 2]
+                if step == 0:
+                    if step_completed:
+                        print(f"\n[STEP 0 INIT] Approaching target...")
+                        print(f"  Start Pos: {current_pose[0]}")
+                        print(f"  Target Pos: {target_pos + np.array([0.0, 0.0, env.GRASP_APPROACH_HEIGHT])}")
+                        
+                        step_completed = False
+                        env.need_plan = True
+                        start_pos, start_rotm = current_pose[0].copy(), current_pose[1]
+                        start_time = current_time
+                        target[:3] = target_pos + np.array([0.0, 0.0, env.GRASP_APPROACH_HEIGHT]) 
+                        target[3:] = [np.pi, 0.0, np.pi / 2]
+                        print(f"  [STEP 0] Planning complete. Moving...")
+
+                    done_move, curr_p, curr_e = env.line_move(
+                        start_pos, start_rotm, target[:3], target[3:], start_time, current_time
+                    )
+                    if done_move:
+                        print(f"  [STEP 0] Completed.")
+                        step = 1
+                        step_completed = True
 
                 # --- Step 1: 抓取 ---
-                elif step == 1 and step_res:
-                    print(f"  -> Step 1: Grasp at {target_pos}")
-                    step = 2; step_res = False; env.need_plan = True
-                    current_pose = env.get_current_pose()
-                    start_pos, start_rotm = current_pose[0], current_pose[1]
-                    start_time = env.data.time
-                    target[:3] = target_pos + np.array([0.0, 0.0, env.GRASP_HEIGHT])
-                    target[3:] = [np.pi, 0.0, np.pi / 2 + target_euler_z]
+                elif step == 1:
+                    if step_completed:
+                        print(f"\n[STEP 1 INIT] Moving to Grasp Height...")
+                        print(f"  Start Pos: {current_pose[0]}")
+                        print(f"  Target Pos: {target_pos + np.array([0.0, 0.0, env.GRASP_HEIGHT])}")
+                        
+                        step_completed = False
+                        env.need_plan = True
+                        start_pos, start_rotm = current_pose[0].copy(), current_pose[1]
+                        start_time = current_time
+                        target[:3] = target_pos + np.array([0.0, 0.0, env.GRASP_HEIGHT])
+                        target[3:] = [np.pi, 0.0, np.pi / 2 + target_euler_z]
+                        print(f"  [STEP 1] Planning complete. Moving...")
+
+                    done_move, curr_p, curr_e = env.line_move(
+                        start_pos, start_rotm, target[:3], target[3:], start_time, current_time
+                    )
+                    if done_move:
+                        print(f"  [STEP 1] Completed.")
+                        step = 2
+                        step_completed = True
 
                 # --- Step 2: 抬起 ---
-                elif step == 2 and step_res:
-                    print("  -> Step 2: Lift")
-                    env.gripper_close()
-                    for _ in range(10):
-                        mujoco.mj_step(env.model, env.data)
-                        viewer.sync()
-                        if 'cam_tip' in env.cameras:
-                            f = env.cameras['cam_tip'].get_frame()
-                            d,_,_ = process_visual_feedback(env, f, 'cam_tip')
-                            cv2.imshow(f"Vision: cam_tip", d)
-                        cv2.waitKey(1); glfw.poll_events()
+                elif step == 2:
+                    if step_completed:
+                        print(f"\n[STEP 2 INIT] Closing Gripper & Lifting...")
+                        env.gripper_close()
+                        # 等待夹爪闭合的物理仿真
+                        for _ in range(15):
+                            mujoco.mj_step(env.model, env.data)
+                            viewer.sync()
+                            glfw.poll_events()
                         
-                    step = 3; step_res = False; env.need_plan = True
-                    current_pose = env.get_current_pose()
-                    start_pos, start_rotm = current_pose[0], current_pose[1]
-                    start_time = env.data.time
-                    target[:3] = target_pos + np.array([0.0, 0.0, env.LIFT_HEIGHT])
-                    target[3:] = [np.pi, 0.0, np.pi / 2]
+                        print(f"  Start Pos: {current_pose[0]}")
+                        print(f"  Target Pos: {target_pos + np.array([0.0, 0.0, env.LIFT_HEIGHT])}")
+                        
+                        step_completed = False
+                        env.need_plan = True
+                        start_pos, start_rotm = current_pose[0].copy(), current_pose[1]
+                        start_time = current_time
+                        target[:3] = target_pos + np.array([0.0, 0.0, env.LIFT_HEIGHT])
+                        target[3:] = [np.pi, 0.0, np.pi / 2]
+                        print(f"  [STEP 2] Planning complete. Moving...")
+
+                    done_move, curr_p, curr_e = env.line_move(
+                        start_pos, start_rotm, target[:3], target[3:], start_time, current_time
+                    )
+                    if done_move:
+                        print(f"  [STEP 2] Completed.")
+                        step = 3
+                        step_completed = True
 
                 # --- Step 3: 移动到放置区域上方 ---
-                elif step == 3 and step_res:
-                    print("  -> Step 3: Move to Place Location (Relative)")
-                    step = 4; step_res = False; env.need_plan = True
-                    current_pose = env.get_current_pose()
-                    start_pos, start_rotm = current_pose[0], current_pose[1]
-                    start_time = env.data.time
-                    
-                    place_offset = np.array([0.20, 0.0, env.LIFT_HEIGHT]) 
-                    place_target = target_pos + place_offset
-                    
-                    print(f"     Calculated Place Target: {place_target}")
-                    target[:3] = place_target
-                    target[3:] = [np.pi, 0.0, np.pi / 2]
+                elif step == 3:
+                    if step_completed:
+                        print(f"\n[STEP 3 INIT] Moving to Place Location (Relative)...")
+                        place_offset = np.array([0.30, 0.0, env.LIFT_HEIGHT]) 
+                        place_target = target_pos + place_offset
+                        print(f"  Start Pos: {current_pose[0]}")
+                        print(f"  Target Pos: {place_target}")
+                        
+                        step_completed = False
+                        env.need_plan = True
+                        start_pos, start_rotm = current_pose[0].copy(), current_pose[1]
+                        start_time = current_time
+                        target[:3] = place_target
+                        target[3:] = [np.pi, 0.0, np.pi / 2]
+                        print(f"  [STEP 3] Planning complete. Moving...")
 
-                # --- Step 4: 下移并检测高度释放 (修复版) ---
-                elif step == 4:
-                    if step_res:
-                        print("  -> Step 4: Moving Down for Release")
-                        step_res = False
-                        env.need_plan = True # 强制重新规划
+                    done_move, curr_p, curr_e = env.line_move(
+                        start_pos, start_rotm, target[:3], target[3:], start_time, current_time
+                    )
+                    if done_move:
+                        print(f"  [STEP 3] Completed.")
+                        step = 4
+                        step_completed = True
+                        # 重置 Step 4 状态
+                        step4_init_done = False
                         release_triggered = False
                         step4_loop_count = 0
-                        
-                        # 【关键修复】重新获取当前实际位置作为起点，避免使用旧变量
-                        current_pose = env.get_current_pose()
-                        start_pos = current_pose[0].copy() # 确保是拷贝
+
+                # --- Step 4: 下移并检测高度释放 ---
+                elif step == 4:
+                    if not step4_init_done:
+                        print(f"\n[STEP 4 INIT] Moving Down for Release...")
+                        current_pose = env.get_current_pose() # 重新获取最新位置
+                        start_pos = current_pose[0].copy()
                         start_rotm = current_pose[1]
-                        start_time = env.data.time
+                        start_time = current_time
                         
-                        # 设置一个绝对安全的低点 (例如 -0.2m)，确保一定穿过阈值
                         target_down_z = -0.20 
-                        # X 方向保持 Step 3 结束的 X + 偏移 (如果需要)，或者保持在 Place Target 的 X
-                        # 这里我们保持在 Step 3 结束时的 X,Y，只改变 Z
                         target_down_pos = np.array([start_pos[0], start_pos[1], target_down_z])
                         
-                        print(f"     [Step 4 Init] Start Z: {start_pos[2]:.4f}, Target Z: {target_down_z:.4f}")
-                        print(f"     [Step 4 Init] Threshold: {RELEASE_HEIGHT_THRESHOLD:.4f}")
+                        print(f"  Start Pos: {start_pos}")
+                        print(f"  Target Pos: {target_down_pos}")
+                        print(f"  Release Threshold: {RELEASE_HEIGHT_THRESHOLD}")
                         
+                        step4_init_done = True
+                        step_completed = False # 运动中
+                        env.need_plan = True
                         target[:3] = target_down_pos
                         target[3:] = [np.pi, 0.0, np.pi / 2]
+                        print(f"  [STEP 4] Planning complete. Moving down...")
 
                     # 执行运动
-                    current_time = env.data.time
                     done_move, curr_p, curr_e = env.line_move(
-                        start_pos, start_rotm, 
-                        target[:3], target[3:], 
-                        start_time, current_time
+                        start_pos, start_rotm, target[:3], target[3:], start_time, current_time
                     )
                     
                     step4_loop_count += 1
                     current_z = curr_p[2]
                     
-                    # 每 20 帧打印一次状态
                     if step4_loop_count % 20 == 0:
-                        print(f"     [Step 4 Run] Loop: {step4_loop_count}, Curr Z: {current_z:.4f}, Done: {done_move}, Planned Dist: {env.d:.4f}")
+                        print(f"  [STEP 4 RUN] Loop: {step4_loop_count}, Curr Z: {current_z:.4f}, Done: {done_move}")
 
-                    # 条件 1: 高度触发释放 (优先判断)
+                    # 条件 1: 高度触发释放
                     if current_z <= RELEASE_HEIGHT_THRESHOLD and not release_triggered:
-                        print(f"  -> [SUCCESS] RELEASE TRIGGERED at Height {current_z:.4f}")
+                        print(f"  [SUCCESS] RELEASE TRIGGERED at Height {current_z:.4f}")
                         env.gripper_open()
                         release_triggered = True
                         
                         step = 5
-                        step_res = True 
-                        simulation_start_time = env.data.time
-                        env.need_plan = True 
+                        step_completed = True # 标记 Step 4 结束，准备进入 Step 5
+                        simulation_start_time = current_time
+                        print(f"  [STEP 4] Transitioning to Step 5...")
                     
                     # 条件 2: 运动规划结束但未触发高度 (异常处理)
-                    # 必须运行足够长的循环数 (例如 50 帧) 才允许判定为“意外结束”，防止启动瞬间误判
                     elif done_move and not release_triggered and step4_loop_count > 50:
-                        print(f"  -> [ERROR] Motion completed prematurely at Z={current_z:.4f} (Threshold={RELEASE_HEIGHT_THRESHOLD}).")
-                        print(f"           Forcing release to avoid hanging, but check your parameters!")
+                        print(f"  [ERROR] Motion completed prematurely at Z={current_z:.4f}. Forcing release.")
                         env.gripper_open()
                         release_triggered = True
                         step = 5
-                        step_res = True
-                        simulation_start_time = env.data.time
-                        env.need_plan = True
-                    
-                    # 状态切换处理
-                    if step == 5 and step_res:
-                         print("  -> Step 5: Free Fall Simulation Started")
-                         step_res = False 
-                         continue 
+                        step_completed = True
+                        simulation_start_time = current_time
 
                 # --- Step 5: 自由落体仿真 ---
-                elif step == 5 and not step_res:
+                elif step == 5:
+                    if step_completed:
+                        print(f"\n[STEP 5 INIT] Free Fall Simulation Started...")
+                        step_completed = False
+                        simulation_start_time = env.data.time # 确保使用最新时间
+
                     elapsed_sim = env.data.time - simulation_start_time
                     if elapsed_sim > SIMULATION_HOLD_TIME:
                         print("✅ Task Completed! Simulation finished.")
-                    
-                elif step >= 6:
-                    break
+                        step = 6 # 结束
+                    else:
+                        if int(elapsed_sim * 10) % 10 == 0: # 每秒打印一次
+                             pass # 可添加进度日志
 
-                # --- 标准运动执行逻辑 (Step 0-3) ---
-                if 0 <= step <= 3 and not step_res:
-                     current_time = env.data.time
-                     done_move, curr_p, curr_e = env.line_move(
-                        start_pos, start_rotm, 
-                        target[:3], target[3:], 
-                        start_time, current_time
-                    )
-                     if done_move:
-                        step_res = True
-                        print(f"     -> Step {step} Completed.")
+                elif step >= 6:
+                    print("All steps finished. Exiting loop.")
+                    break
 
                 # 事件处理
                 glfw.poll_events()
@@ -807,6 +874,7 @@ if __name__ == "__main__":
                 mujoco.mj_step(env.model, env.data)
                 viewer.sync()
 
+                # 时间控制
                 time_until_next_step = env.dt - (time.time() - step_start)
                 if time_until_next_step > 0:
                     time.sleep(time_until_next_step)
@@ -819,7 +887,7 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         print("Shutting down...")
-        frame_buffer.stop_flag = True
+        frame_buffer.stop()
         if detection_thread:
             detection_thread.join(timeout=2.0)
         
