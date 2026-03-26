@@ -6,30 +6,68 @@ import cv2
 import glfw
 import os
 import sys
+import threading
+import queue
 
 # ================= 配置区域 =================
-DETECTION_MODE = 'color_only'  # 'yolo_color' 或 'color_only'
-MODEL_PATH = './ur5e_robotiq2f85/scene.xml'  # 确保路径正确
-# ===========================================
+DETECTION_MODE = 'color_only'
+MODEL_PATH = './ur5e_robotiq2f85/scene.xml'
 
-# 尝试导入 YOLO
+# 【新增】手眼标定补偿参数
+VISION_OFFSET = np.array([0.0025, -0.0015, 0.0]) 
+
+# 【新增】放置释放高度阈值
+# 物体高度约 0.04，设为 0.06 确保在接触前一点点释放，或者刚好接触
+RELEASE_HEIGHT_THRESHOLD = 0.06 
+
+# 【新增】自由落体仿真持续时间 (秒)
+SIMULATION_HOLD_TIME = 2.0 
+
 try:
     from ultralytics import YOLO
     HAS_YOLO = True
 except ImportError:
     HAS_YOLO = False
-    print("Warning: ultralytics not found. Falling back to pure color detection.")
 
-# 设置 MuJoCo 渲染后端
 os.environ['MUJOCO_GL'] = 'glfw'
+
+# ================= 线程安全通信类 =================
+class FrameBuffer:
+    def __init__(self, maxsize=2):
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.latest_result = {
+            'found': False,
+            'pos': None,
+            'euler_z': 0.0,
+            'debug_img': None,
+            'pixel_coords': None
+        }
+        self.lock = threading.Lock()
+        self.stop_flag = False
+
+    def put_frame(self, cam_name, image_rgb):
+        try:
+            if not self.queue.full():
+                self.queue.put((cam_name, image_rgb))
+        except queue.Full:
+            pass
+
+    def set_result(self, found, pos, euler_z, debug_img, pixel_coords=None):
+        with self.lock:
+            self.latest_result['found'] = found
+            self.latest_result['pos'] = pos
+            self.latest_result['euler_z'] = euler_z
+            self.latest_result['debug_img'] = debug_img
+            self.latest_result['pixel_coords'] = pixel_coords
+
+    def get_result(self):
+        with self.lock:
+            return self.latest_result.copy()
+
+frame_buffer = FrameBuffer()
 
 class env_cam:
     def __init__(self, model, data, camera_name, width=640, height=480):
-        """
-        初始化相机类。
-        耗时：约 10-50ms/个 (取决于 GPU 驱动和 GLFW 初始化速度)
-        位置：在 PickBoxEnv.__init__ -> self._init_cameras() 中被调用
-        """
         self.model = model
         self.data = data
         self.name = camera_name
@@ -39,7 +77,6 @@ class env_cam:
         if not glfw.init():
             raise RuntimeError("Could not initialize GLFW")
         
-        # 创建不可见窗口用于离屏渲染
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
         window = glfw.create_window(self.width, self.height, f"Cam: {camera_name}", None, None)
         if not window:
@@ -62,42 +99,39 @@ class env_cam:
         self.perturb = mujoco.MjvPerturb()
         
         self._window = window
+        self.ready = False
 
     def get_frame(self):
-        """获取当前帧的 RGB numpy 数组"""
         mujoco.mjv_updateScene(self.model, self.data, self.vopt, self.perturb, self.camera, mujoco.mjtCatBit.mjCAT_ALL, self.scene)
         viewport = mujoco.MjrRect(0, 0, self.width, self.height)
         mujoco.mjr_render(viewport, self.scene, self.context)
         mujoco.mjr_readPixels(self.rgb_buffer, None, viewport, self.context)
-        # MuJoCo reads from bottom-up, flip to top-down
-        return np.flipud(self.rgb_buffer).copy()
+        
+        frame = np.flipud(self.rgb_buffer).copy()
+        if not frame.flags['C_CONTIGUOUS']:
+            frame = np.ascontiguousarray(frame)
+        return frame
 
     def show_img_debug(self, image=None, wait_key=1):
-        """显示调试图像到 OpenCV 窗口"""
         if image is None:
             glfw.poll_events()
             cv2.waitKey(1)
             return
         
-        # 确保传入的是 BGR 格式给 OpenCV imshow
-        # 如果输入是 RGB (来自 get_frame)，需要转换
         if len(image.shape) == 3 and image.shape[2] == 3:
-            # 检查是否已经是 BGR (简单启发式：如果 R 通道值普遍很高且 B 很低，可能是 RGB)
-            # 这里为了安全，假设外部传入的是 RGB (因为 get_frame 返回 RGB)
-            # 但 detect_target_visual 内部已经处理了转换并传回 BGR 用于显示逻辑
-            # 为了统一，这里假设传入的是 BGR (由调用者保证) 或者强制转换
-            # 修正策略：调用者 (detect_target_visual) 应该传入已经准备好显示的 BGR 图像
-            bgr_image = image 
+            bgr_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         else:
             bgr_image = image
             
+        if not bgr_image.flags['C_CONTIGUOUS']:
+            bgr_image = np.ascontiguousarray(bgr_image)
+
         cv2.imshow(f"Vision: {self.name}", bgr_image)
         key = cv2.waitKey(wait_key)
         glfw.poll_events()
         return key
 
-    def _estimate_world_pos_from_pixel(self, px, py, assumed_z=0.03):
-        """简单的针孔相机模型反投影"""
+    def _estimate_world_pos_from_pixel(self, px, py, assumed_z=0.03, debug=False):
         cam_id = self.camera.fixedcamid
         if cam_id >= self.data.cam_xpos.shape[0]:
             return None
@@ -107,21 +141,22 @@ class env_cam:
         cam_mat = cam_mat_flat.reshape(3, 3)
         
         nx = (px - self.width / 2) / (self.width / 2)
-        ny = -(py - self.height / 2) / (self.height / 2) 
+        ny = -(py - self.height / 2) / (self.height / 2)
         
         fovy = self.model.cam_fovy[cam_id] if cam_id < len(self.model.cam_fovy) else 60.0
         fov = np.radians(fovy)
         aspect = self.width / self.height
         tan_half_fov = np.tan(fov / 2)
         
-        ray_cam = np.array([nx * tan_half_fov * aspect, ny * tan_half_fov, 1.0])
+        ray_cam = np.array([nx * tan_half_fov * aspect, ny * tan_half_fov, -1.0])
         ray_cam /= np.linalg.norm(ray_cam)
         
         ray_world = cam_mat @ ray_cam
-        
+        ray_world = ray_world / np.linalg.norm(ray_world)
+
         denom = ray_world[2]
-        if abs(denom) < 1e-6: 
-            return None 
+        if abs(denom) < 1e-6:
+            return None
             
         t = (assumed_z - cam_pos[2]) / denom
         if t < 0: 
@@ -136,28 +171,38 @@ class env_cam:
 
 class PickBoxEnv:
     def __init__(self):
-        # ================= 运动参数 =================
-        self.CARTESIAN_VELOCITY = 0.05
-        self.CARTESIAN_ACCELERATION = 0.05
-        self.MAX_JOINT_STEP = 0.05
-        self.TOLERANCE = 0.002
+        self.CARTESIAN_VELOCITY_SAFE = 0.20
+        self.CARTESIAN_ACCELERATION_SAFE = 0.40
+        self.MAX_JOINT_STEP_SAFE = 0.05
+        self.TOLERANCE_SAFE = 0.005
+        
+        self.CARTESIAN_VELOCITY_FAST = 2.50
+        self.CARTESIAN_ACCELERATION_FAST = 5.00
+        self.MAX_JOINT_STEP_FAST = 0.50
+        self.TOLERANCE_FAST = 0.02
+        
+        self.CARTESIAN_VELOCITY = self.CARTESIAN_VELOCITY_SAFE
+        self.CARTESIAN_ACCELERATION = self.CARTESIAN_ACCELERATION_SAFE
+        self.MAX_JOINT_STEP = self.MAX_JOINT_STEP_SAFE
+        self.TOLERANCE = self.TOLERANCE_SAFE
+        
+        self.high_speed_mode = False
         self.INTEGRATION_DT = 1.0
         self.IK_DAMPING = 0.0001
         
         self.GRASP_APPROACH_HEIGHT = 0.30
         self.GRASP_HEIGHT = 0.05
         self.LIFT_HEIGHT = 0.30
-        self.PLACE_POS = np.array([0.2, 0.0, 0.0])
-        # ===========================================
+        
+        self.BASE_PLACE_POS = np.array([0.2, 0.0, 0.0])
 
         if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Model file not found at {MODEL_PATH}. Please check the path.")
+            raise FileNotFoundError(f"Model file not found at {MODEL_PATH}.")
             
         self.model = mujoco.MjModel.from_xml_path(MODEL_PATH)
         self.data = mujoco.MjData(self.model)
         self.dt = self.model.opt.timestep
 
-        # 关节与执行器 ID
         joint_names = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
                        "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
         self.joint_ids = []
@@ -179,7 +224,6 @@ class PickBoxEnv:
         except Exception:
             self.site_id = -1 
 
-        # 初始化运动控制变量
         damping = self.IK_DAMPING
         self.jac = np.zeros([6, self.model.nv])
         self.diag = damping * np.eye(6)
@@ -192,20 +236,51 @@ class PickBoxEnv:
         self.dx, self.dy, self.dz, self.d = 0, 0, 0, 0
         self.need_plan = True
 
-        # 【关键位置】初始化所有场景相机
-        # 耗时：此处发生，每个相机约 10-50ms
         self.cameras = {}
         self._init_cameras()
 
-        # 设置初始状态并前向计算
         self.move2init()
         self.gripper_open()
         mujoco.mj_forward(self.model, self.data)
 
+        self._print_object_positions()
+
+    def compensate_offset(self, raw_pos):
+        if raw_pos is None:
+            return None
+        compensated_pos = raw_pos + VISION_OFFSET
+        print(f"   [Compensation] Raw: [{raw_pos[0]:.4f}, {raw_pos[1]:.4f}, {raw_pos[2]:.4f}] -> Compensated: [{compensated_pos[0]:.4f}, {compensated_pos[1]:.4f}, {compensated_pos[2]:.4f}]")
+        return compensated_pos
+
+    def _print_object_positions(self):
+        print("\n=== SCENE OBJECT INITIALIZATION ===")
+        found_objects = False
+        for body_id in range(self.model.nbody):
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name and 'box' in body_name.lower():
+                pos = self.data.xpos[body_id].copy()
+                print(f"  -> Object: '{body_name}' | Pos: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+                found_objects = True
+        if not found_objects:
+            print("  -> No objects found.")
+        print(f"  -> Vision Offset: {VISION_OFFSET}")
+        print("=====================================\n")
+
+    def enable_high_speed_mode(self):
+        if self.high_speed_mode:
+            return
+        print("\n⚡ SWITCHING TO HIGH-SPEED MODE! ⚡")
+        self.high_speed_mode = True
+        self.CARTESIAN_VELOCITY = self.CARTESIAN_VELOCITY_FAST
+        self.CARTESIAN_ACCELERATION = self.CARTESIAN_ACCELERATION_FAST
+        self.MAX_JOINT_STEP = self.MAX_JOINT_STEP_FAST
+        self.TOLERANCE = self.TOLERANCE_FAST
+        self.v = self.CARTESIAN_VELOCITY
+        self.a = self.CARTESIAN_ACCELERATION
+        self.need_plan = True
+
     def _init_cameras(self):
-        """自动发现并初始化所有非内部相机"""
         print("Initializing cameras...")
-        start_time = time.time()
         for i in range(self.model.ncam):
             cam_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, i)
             if cam_name in ['cam_world', 'cam_tip']: 
@@ -215,8 +290,6 @@ class PickBoxEnv:
                     print(f"  -> Initialized camera: {cam_name}")
                 except Exception as e:
                     print(f"  -> Failed to init camera {cam_name}: {e}")
-        elapsed = time.time() - start_time
-        print(f"Camera initialization completed in {elapsed:.3f} seconds.")
 
     def reset(self):
         self.move2init()
@@ -224,25 +297,20 @@ class PickBoxEnv:
         mujoco.mj_forward(self.model, self.data)
 
     def move2init(self):
-        """设置机械臂初始状态并确保其静止"""
-        # 定义初始姿态 (弧度)
         init_qpos = [0, -1.5708, 1.5708, -1.5708, -1.5708, 0]
-        
         if self.model.njnt >= 6:
             limits = self.model.jnt_range[:6]
-            safe_qpos = np.clip(init_qpos, limits[:, 0], limits[:, 1])
-            
-            # 1. 设置位置
-            self.data.qpos[:6] = safe_qpos
-            # 2. 清零速度
-            self.data.qvel[:6] = 0.0
-            # 3. 前向传播
+            if self.high_speed_mode:
+                safe_qpos = self.data.qpos[:6].copy()
+                self.data.qvel[:6] *= 0.5 
+            else:
+                safe_qpos = np.clip(init_qpos, limits[:, 0], limits[:, 1])
+                self.data.qpos[:6] = safe_qpos
+                self.data.qvel[:6] = 0.0
             mujoco.mj_forward(self.model, self.data)
-            # 4. 强制将控制目标设置为当前位置 (防止重力下落)
             if self.model.nu >= 6:
                 self.data.ctrl[:6] = safe_qpos
-
-        mujoco.mj_forward(self.model, self.data)
+            mujoco.mj_forward(self.model, self.data)
 
     def gripper_open(self): 
         if self.model.nu > 0:
@@ -258,7 +326,6 @@ class PickBoxEnv:
             rotm_flat = np.eye(9).flatten()
             rotm_33 = np.eye(3)
             return pos, rotm_33, rotm_flat
-            
         pos = self.data.site(self.site_id).xpos.copy()
         rotm_flat = self.data.site(self.site_id).xmat.copy() 
         rotm_33 = rotm_flat.reshape(3, 3)
@@ -272,7 +339,10 @@ class PickBoxEnv:
         
         t = cur_time - start_time
         if self.t3 == 0: 
+            # 如果规划距离为 0，直接返回完成
             return True, target_pos, target_euler
+
+        if t < 0: t = 0 
 
         if t < self.t1:
             deltaD = 0.5 * self.a * t**2
@@ -282,9 +352,10 @@ class PickBoxEnv:
             deltaT = t - self.t2
             deltaD = self.d2 + self.v * deltaT - 0.5 * self.a * deltaT**2
         else:
+            # 时间超过总时间，视为完成
             return True, target_pos, target_euler
 
-        ratio = deltaD / self.d if self.d > 0 else 1.0
+        ratio = deltaD / self.d if self.d > 1e-6 else 1.0
         curr_p = start_pos + np.array([self.dx, self.dy, self.dz]) * ratio
         curr_e = self.start_euler + (self.target_euler_full - self.start_euler) * ratio
         
@@ -297,6 +368,9 @@ class PickBoxEnv:
         d = np.linalg.norm([dx, dy, dz])
         self.dx, self.dy, self.dz, self.d = dx, dy, dz, d
         
+        # 【调试】打印规划信息
+        # print(f"     [Plan Debug] Dist: {d:.4f}, Start: {start_pos}, End: {end_pos}")
+
         if d < 1e-6:
             self.t1 = self.t2 = self.t3 = 0
             return
@@ -324,6 +398,10 @@ class PickBoxEnv:
             self.t3 = 2*t1
             self.d1 = self.d2 = d/2
             self.d3 = d
+        
+        # 【调试】打印时间信息
+        # print(f"     [Plan Debug] T1: {self.t1:.2f}, T2: {self.t2:.2f}, T3: {self.t3:.2f}")
+        
         self.need_plan = False
 
     def move2pose(self, target_pos, target_euler, flag=True):
@@ -344,7 +422,7 @@ class PickBoxEnv:
         mujoco.mju_mulQuat(error_quat, target_quat, cur_quat_conj)
         mujoco.mju_quat2Vel(self.error[3:], error_quat, 1.0)
 
-        if np.linalg.norm(self.error[:3]) < self.TOLERANCE and np.linalg.norm(self.error[3:]) < 0.01:
+        if np.linalg.norm(self.error[:3]) < self.TOLERANCE and np.linalg.norm(self.error[3:]) < (self.TOLERANCE * 5):
             return True
 
         if self.site_id != -1:
@@ -379,167 +457,150 @@ class PickBoxEnv:
             roll = np.arctan2(R[2, 1], R[2, 2])
         return np.array([roll, pitch, yaw])
 
-# ================= 视觉检测函数 =================
+# ================= 视觉检测函数 (全局可用) =================
 
 def get_blue_mask(hsv_img):
-    # 蓝色在 HSV 中的范围 (OpenCV H: 0-180)
-    # 蓝色通常在 100-130 之间
-    lower_blue = np.array([100, 150, 150], dtype=np.uint8)
-    upper_blue = np.array([130, 255, 255], dtype=np.uint8)
+    lower_blue = np.array([90, 100, 100], dtype=np.uint8)
+    upper_blue = np.array([140, 255, 255], dtype=np.uint8)
     mask = cv2.inRange(hsv_img, lower_blue, upper_blue)
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=3)
     return mask
 
-def detect_target_visual(env, model_yolo=None):
-    """
-    检测目标并返回结果。
-    【关键修复】正确处理 RGB -> BGR -> HSV 的颜色空间转换。
-    """
-    if not env.cameras:
-        return False, None, None, {}
-
-    best_result = None
-    max_area_global = 0
-    debug_images = {}
-
-    primary_cam_name = 'cam_world' if 'cam_world' in env.cameras else list(env.cameras.keys())[0]
+def process_visual_feedback(env, frame_rgb, cam_name):
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    hsv_img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     
-    for name, cam_obj in env.cameras.items():
-        # 1. 获取帧 (RGB 格式)
-        frame_rgb = cam_obj.get_frame()
-        
-        # 2. 【修复】必须先转为 BGR，再转为 HSV
-        # MuJoCo 输出 RGB, OpenCV 期望 BGR 进行大部分操作，特别是 cvtColor(BGR2HSV)
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        
-        # 3. 转为 HSV 进行颜色分割
-        hsv_img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        
-        h, w, _ = frame_bgr.shape
+    best_cnt = None
+    max_area = 0
+    cx, cy = 0, 0
+    found_local = False
+    
+    if DETECTION_MODE == 'color_only':
+        mask = get_blue_mask(hsv_img)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > 300: 
+                if area > max_area:
+                    max_area = area
+                    best_cnt = cnt
+                    x, y, wr, hr = cv2.boundingRect(cnt)
+                    cx, cy = x + wr // 2, y + hr // 2
+    
+    debug_img = frame_bgr.copy()
+    label_status = "Searching..."
+    
+    if max_area > 0 and best_cnt is not None:
+        cv2.drawContours(debug_img, [best_cnt], -1, (0, 255, 0), 2)
+        cv2.circle(debug_img, (cx, cy), 8, (0, 0, 255), -1)
+        label_status = f"Tracking! Area: {max_area}"
+        found_local = True
+    
+    cv2.putText(debug_img, f"{cam_name}: {label_status}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    
+    frame_buffer.set_result(
+        found=found_local,
+        pos=None,
+        euler_z=0.0,
+        debug_img=debug_img,
+        pixel_coords=(cx, cy) if found_local else None
+    )
+    
+    return debug_img, found_local, (cx, cy)
 
-        best_cnt = None
-        max_area = 0
-        cx, cy = 0, 0
-
-        if DETECTION_MODE == 'yolo_color' and model_yolo is not None and HAS_YOLO:
-            results = model_yolo(frame_bgr, verbose=False, conf=0.4)
-            if len(results[0].boxes) > 0:
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                for box in boxes:
-                    x1, y1, x2, y2 = map(int, box)
-                    center_x, center_y = int((x1 + x2) / 2), int((y1 + y2) / 2)
-                    roi = hsv_img[y1:y2, x1:x2]
-                    if roi.size == 0: continue
-                    mean_hue = np.mean(roi[:, :, 0])
-                    if 100 <= mean_hue <= 130: # 蓝色范围
-                        area = (x2 - x1) * (y2 - y1)
-                        if area > max_area:
-                            max_area = area
-                            cx, cy = center_x, center_y
-                            best_cnt = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
-        
-        elif DETECTION_MODE == 'color_only':
-            mask = get_blue_mask(hsv_img)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > 500:
-                    if area > max_area:
-                        max_area = area
-                        best_cnt = cnt
-                        x, y, wr, hr = cv2.boundingRect(cnt)
-                        cx, cy = x + wr // 2, y + hr // 2
-
-        # 准备调试图像 (使用 BGR 格式以便 OpenCV 显示)
-        debug_img = frame_bgr.copy()
-        label_status = "Searching..."
-        
-        if max_area > 0 and best_cnt is not None:
-            if DETECTION_MODE == 'color_only':
-                cv2.drawContours(debug_img, [best_cnt], -1, (0, 255, 0), 2)
-            cv2.circle(debug_img, (cx, cy), 8, (0, 0, 255), -1)
-            label_status = f"Detected (Area: {max_area})"
+def detection_thread_func(env):
+    while not frame_buffer.stop_flag:
+        try:
+            try:
+                cam_name, frame_rgb = frame_buffer.queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             
-            if name == primary_cam_name:
-                assumed_z_height = 0.04
-                world_pos = cam_obj._estimate_world_pos_from_pixel(cx, cy, assumed_z=assumed_z_height)
-                if world_pos is not None:
-                    label_pos = f"Pos: [{world_pos[0]:.2f}, {world_pos[1]:.2f}, {world_pos[2]:.2f}]"
-                    cv2.putText(debug_img, label_pos, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    
-                    if max_area > max_area_global:
-                        max_area_global = max_area
-                        best_result = (True, world_pos, 0.0)
-                else:
-                    best_result = (False, None, None)
-        
-        cv2.putText(debug_img, f"{name}: {label_status}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        debug_images[name] = debug_img
-
-    if best_result is None:
-        best_result = (False, None, None)
-
-    return best_result[0], best_result[1], best_result[2], debug_images
+            if cam_name != 'cam_tip':
+                continue
+                
+            process_visual_feedback(env, frame_rgb, cam_name)
+        except Exception as e:
+            time.sleep(0.01)
 
 # ================= 主程序 =================
 
 if __name__ == "__main__":
     env = None
-    yolo_model = None
+    detection_thread = None
 
     try:
         print("Loading MuJoCo Model...")
         env = PickBoxEnv()
         
-        if DETECTION_MODE == 'yolo_color' and HAS_YOLO:
-            print("Loading YOLOv11 model...")
-            try:
-                yolo_model = YOLO('yolo11n.pt') 
-            except Exception as e:
-                print(f"Failed to load YOLO: {e}. Using color-only logic.")
-                yolo_model = None
+        detection_thread = threading.Thread(target=detection_thread_func, args=(env,), daemon=True)
+        detection_thread.start()
 
         with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
             env.reset()
             
-            print("Warming up visualization and cameras...")
-            # 预热循环
-            for _ in range(100):
-                # 在预热期间也锁定控制，防止微小漂移
+            print("Warming up...")
+            for i in range(200):
                 if env.model.nu >= 6:
                     env.data.ctrl[:6] = env.data.qpos[:6]
-                
                 mujoco.mj_step(env.model, env.data)
                 viewer.sync()
-                for cam in env.cameras.values():
-                    _ = cam.get_frame()
+                for name, cam in env.cameras.items():
+                    frame = cam.get_frame()
+                    test_img = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    cv2.imshow(f"Vision: {name}", test_img)
                 glfw.poll_events()
+                cv2.waitKey(1)
 
-            print("=== STARTING DETECTION PHASE (Robot Stationary) ===")
-            print("Press Ctrl+C in terminal to abort.")
+            print("=== PHASE 1: WAITING FOR DETECTION ===")
             
-            target_pos = None
-            target_euler_z = 0.0
-            
-            # --- 阶段 1: 静止检测循环 ---
             detected = False
+            final_target_pos_compensated = None
+            
             while not detected and viewer.is_running():
                 step_start = time.time()
                 
-                found, pos, euler_z, debug_imgs = detect_target_visual(env, yolo_model)
+                cam_images = {}
+                for name, cam in env.cameras.items():
+                    cam_images[name] = cam.get_frame()
                 
-                for name, img in debug_imgs.items():
-                    if name in env.cameras:
-                        env.cameras[name].show_img_debug(img, wait_key=1)
+                if 'cam_tip' in cam_images:
+                    frame_buffer.put_frame('cam_tip', cam_images['cam_tip'])
                 
-                if found:
-                    print(f"\n🎯 TARGET LOCKED!")
-                    print(f"   Position: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-                    target_pos = pos
-                    target_euler_z = euler_z
-                    detected = True
+                if 'cam_world' in cam_images:
+                    frame_bgr = cv2.cvtColor(cam_images['cam_world'], cv2.COLOR_RGB2BGR)
+                    cv2.imshow(f"Vision: cam_world", frame_bgr)
+
+                result = frame_buffer.get_result()
+                if result['debug_img'] is not None:
+                    cv2.imshow(f"Vision: cam_tip", result['debug_img'])
+                    
+                    if result['found'] and result['pixel_coords'] and not detected:
+                        cx, cy = result['pixel_coords']
+                        cam_tip_obj = env.cameras['cam_tip']
+                        
+                        possible_z_heights = [0.04] 
+                        world_pos = None
+                        
+                        for z_try in possible_z_heights:
+                            pos_candidate = cam_tip_obj._estimate_world_pos_from_pixel(cx, cy, assumed_z=z_try, debug=False)
+                            if pos_candidate is not None:
+                                if -0.8 < pos_candidate[0] < 0.9 and -0.6 < pos_candidate[1] < 0.6:
+                                    world_pos = pos_candidate
+                                    break
+                        
+                        if world_pos is not None:
+                            print(f"\n🎯 TARGET LOCKED! Raw Pos: {world_pos}")
+                            final_target_pos_compensated = env.compensate_offset(world_pos)
+                            env.enable_high_speed_mode()
+                            detected = True
+                
+                glfw.poll_events()
+                key = cv2.waitKey(1)
+                if key == ord('q'):
+                    break
 
                 mujoco.mj_step(env.model, env.data)
                 viewer.sync()
@@ -549,11 +610,20 @@ if __name__ == "__main__":
                     time.sleep(env.dt - elapsed)
 
             if not detected:
-                print("Detection loop ended without finding target.")
+                print("Detection failed.")
+                frame_buffer.stop_flag = True
+                if detection_thread:
+                    detection_thread.join(timeout=1.0)
                 sys.exit(0)
 
-            # --- 阶段 2: 执行抓取任务 ---
-            print("=== STARTING MANIPULATION SEQUENCE ===")
+            frame_buffer.stop_flag = True
+            if detection_thread:
+                detection_thread.join(timeout=1.0)
+            print("Background detection thread stopped. Switching to main-loop visual feedback.")
+
+            print("=== STARTING HIGH-SPEED MANIPULATION ===")
+            target_pos = final_target_pos_compensated
+            target_euler_z = 0.0
             
             step = 0 
             step_res = True 
@@ -561,91 +631,178 @@ if __name__ == "__main__":
             start_rotm = None
             start_time = 0
             target = np.zeros(6)
+            
+            release_triggered = False
+            simulation_start_time = 0
+            step4_loop_count = 0
 
             while viewer.is_running():
                 step_start = time.time()
                 
+                # ================= 视觉反馈强制刷新 =================
+                if 'cam_tip' in env.cameras:
+                    frame_tip_raw = env.cameras['cam_tip'].get_frame()
+                    debug_img_tip, _, _ = process_visual_feedback(env, frame_tip_raw, 'cam_tip')
+                    cv2.imshow(f"Vision: cam_tip", debug_img_tip)
+                
+                if 'cam_world' in env.cameras:
+                    frame_world_raw = env.cameras['cam_world'].get_frame()
+                    frame_world_bgr = cv2.cvtColor(frame_world_raw, cv2.COLOR_RGB2BGR)
+                    cv2.imshow(f"Vision: cam_world", frame_world_bgr)
+                # =============================================================
+
+                # --- Step 0: 接近 ---
                 if step == 0 and step_res:
-                    print("  -> Step 0: Moving to Approach Height...")
+                    print(f"  -> Step 0: Approach to {target_pos}")
                     step = 1; step_res = False; env.need_plan = True
                     current_pose = env.get_current_pose()
                     start_pos, start_rotm = current_pose[0], current_pose[1]
                     start_time = env.data.time
-                    
                     target[:3] = target_pos + np.array([0.0, 0.0, env.GRASP_APPROACH_HEIGHT]) 
                     target[3:] = [np.pi, 0.0, np.pi / 2]
 
+                # --- Step 1: 抓取 ---
                 elif step == 1 and step_res:
-                    print("  -> Step 1: Moving Down to Grasp...")
+                    print(f"  -> Step 1: Grasp at {target_pos}")
                     step = 2; step_res = False; env.need_plan = True
                     current_pose = env.get_current_pose()
                     start_pos, start_rotm = current_pose[0], current_pose[1]
                     start_time = env.data.time
-                    
                     target[:3] = target_pos + np.array([0.0, 0.0, env.GRASP_HEIGHT])
                     target[3:] = [np.pi, 0.0, np.pi / 2 + target_euler_z]
 
+                # --- Step 2: 抬起 ---
                 elif step == 2 and step_res:
-                    print("  -> Step 2: Closing Gripper & Lifting...")
+                    print("  -> Step 2: Lift")
                     env.gripper_close()
-                    for _ in range(30):
+                    for _ in range(10):
                         mujoco.mj_step(env.model, env.data)
                         viewer.sync()
-                    
+                        if 'cam_tip' in env.cameras:
+                            f = env.cameras['cam_tip'].get_frame()
+                            d,_,_ = process_visual_feedback(env, f, 'cam_tip')
+                            cv2.imshow(f"Vision: cam_tip", d)
+                        cv2.waitKey(1); glfw.poll_events()
+                        
                     step = 3; step_res = False; env.need_plan = True
                     current_pose = env.get_current_pose()
                     start_pos, start_rotm = current_pose[0], current_pose[1]
                     start_time = env.data.time
-                    
                     target[:3] = target_pos + np.array([0.0, 0.0, env.LIFT_HEIGHT])
                     target[3:] = [np.pi, 0.0, np.pi / 2]
 
+                # --- Step 3: 移动到放置区域上方 ---
                 elif step == 3 and step_res:
-                    print("  -> Step 3: Moving to Place Location...")
+                    print("  -> Step 3: Move to Place Location (Relative)")
                     step = 4; step_res = False; env.need_plan = True
                     current_pose = env.get_current_pose()
                     start_pos, start_rotm = current_pose[0], current_pose[1]
                     start_time = env.data.time
                     
-                    place_target = env.PLACE_POS + np.array([0.0, 0.0, env.LIFT_HEIGHT])
+                    place_offset = np.array([0.20, 0.0, env.LIFT_HEIGHT]) 
+                    place_target = target_pos + place_offset
+                    
+                    print(f"     Calculated Place Target: {place_target}")
                     target[:3] = place_target
                     target[3:] = [np.pi, 0.0, np.pi / 2]
 
-                elif step == 4 and step_res:
-                    print("  -> Step 4: Moving Down to Place...")
-                    step = 5; step_res = False; env.need_plan = True
-                    current_pose = env.get_current_pose()
-                    start_pos, start_rotm = current_pose[0], current_pose[1]
-                    start_time = env.data.time
-                    
-                    target[:3] = env.PLACE_POS + np.array([0.0, 0.0, env.GRASP_HEIGHT])
-                    target[3:] = [np.pi, 0.0, np.pi / 2]
+                # --- Step 4: 下移并检测高度释放 (修复版) ---
+                elif step == 4:
+                    if step_res:
+                        print("  -> Step 4: Moving Down for Release")
+                        step_res = False
+                        env.need_plan = True # 强制重新规划
+                        release_triggered = False
+                        step4_loop_count = 0
+                        
+                        # 【关键修复】重新获取当前实际位置作为起点，避免使用旧变量
+                        current_pose = env.get_current_pose()
+                        start_pos = current_pose[0].copy() # 确保是拷贝
+                        start_rotm = current_pose[1]
+                        start_time = env.data.time
+                        
+                        # 设置一个绝对安全的低点 (例如 -0.2m)，确保一定穿过阈值
+                        target_down_z = -0.20 
+                        # X 方向保持 Step 3 结束的 X + 偏移 (如果需要)，或者保持在 Place Target 的 X
+                        # 这里我们保持在 Step 3 结束时的 X,Y，只改变 Z
+                        target_down_pos = np.array([start_pos[0], start_pos[1], target_down_z])
+                        
+                        print(f"     [Step 4 Init] Start Z: {start_pos[2]:.4f}, Target Z: {target_down_z:.4f}")
+                        print(f"     [Step 4 Init] Threshold: {RELEASE_HEIGHT_THRESHOLD:.4f}")
+                        
+                        target[:3] = target_down_pos
+                        target[3:] = [np.pi, 0.0, np.pi / 2]
 
-                elif step == 5 and step_res:
-                    print("  -> Step 5: Opening Gripper & Retract...")
-                    env.gripper_open()
-                    for _ in range(30):
-                        mujoco.mj_step(env.model, env.data)
-                        viewer.sync()
-                    
-                    step = 6
-                    print("✅ Task Completed Successfully!")
-                    break 
-
-                if step < 6:
+                    # 执行运动
                     current_time = env.data.time
                     done_move, curr_p, curr_e = env.line_move(
                         start_pos, start_rotm, 
                         target[:3], target[3:], 
                         start_time, current_time
                     )
-                    if done_move:
-                        step_res = True
+                    
+                    step4_loop_count += 1
+                    current_z = curr_p[2]
+                    
+                    # 每 20 帧打印一次状态
+                    if step4_loop_count % 20 == 0:
+                        print(f"     [Step 4 Run] Loop: {step4_loop_count}, Curr Z: {current_z:.4f}, Done: {done_move}, Planned Dist: {env.d:.4f}")
 
-                _, _, _, debug_imgs = detect_target_visual(env, yolo_model)
-                for name, img in debug_imgs.items():
-                    if name in env.cameras:
-                        env.cameras[name].show_img_debug(img, wait_key=1)
+                    # 条件 1: 高度触发释放 (优先判断)
+                    if current_z <= RELEASE_HEIGHT_THRESHOLD and not release_triggered:
+                        print(f"  -> [SUCCESS] RELEASE TRIGGERED at Height {current_z:.4f}")
+                        env.gripper_open()
+                        release_triggered = True
+                        
+                        step = 5
+                        step_res = True 
+                        simulation_start_time = env.data.time
+                        env.need_plan = True 
+                    
+                    # 条件 2: 运动规划结束但未触发高度 (异常处理)
+                    # 必须运行足够长的循环数 (例如 50 帧) 才允许判定为“意外结束”，防止启动瞬间误判
+                    elif done_move and not release_triggered and step4_loop_count > 50:
+                        print(f"  -> [ERROR] Motion completed prematurely at Z={current_z:.4f} (Threshold={RELEASE_HEIGHT_THRESHOLD}).")
+                        print(f"           Forcing release to avoid hanging, but check your parameters!")
+                        env.gripper_open()
+                        release_triggered = True
+                        step = 5
+                        step_res = True
+                        simulation_start_time = env.data.time
+                        env.need_plan = True
+                    
+                    # 状态切换处理
+                    if step == 5 and step_res:
+                         print("  -> Step 5: Free Fall Simulation Started")
+                         step_res = False 
+                         continue 
+
+                # --- Step 5: 自由落体仿真 ---
+                elif step == 5 and not step_res:
+                    elapsed_sim = env.data.time - simulation_start_time
+                    if elapsed_sim > SIMULATION_HOLD_TIME:
+                        print("✅ Task Completed! Simulation finished.")
+                    
+                elif step >= 6:
+                    break
+
+                # --- 标准运动执行逻辑 (Step 0-3) ---
+                if 0 <= step <= 3 and not step_res:
+                     current_time = env.data.time
+                     done_move, curr_p, curr_e = env.line_move(
+                        start_pos, start_rotm, 
+                        target[:3], target[3:], 
+                        start_time, current_time
+                    )
+                     if done_move:
+                        step_res = True
+                        print(f"     -> Step {step} Completed.")
+
+                # 事件处理
+                glfw.poll_events()
+                key = cv2.waitKey(1)
+                if key == ord('q'):
+                    break
 
                 mujoco.mj_step(env.model, env.data)
                 viewer.sync()
@@ -662,9 +819,12 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         print("Shutting down...")
+        frame_buffer.stop_flag = True
+        if detection_thread:
+            detection_thread.join(timeout=2.0)
+        
         if env:
             env.gripper_open()
-            env.move2init()
             for cam in env.cameras.values():
                 cam.close()
         glfw.terminate()
