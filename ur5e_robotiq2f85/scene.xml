@@ -30,7 +30,7 @@
       <freejoint/>
       <geom type="box" size="0.02 0.02 0.02" rgba="0.1 1 0.1 1"/>
     </body>
-    <body name="box3" pos="-0.4 0.0 0.04" >
+    <body name="box3" pos="-0.68 0.0 0.04" >
       <freejoint/>
       <geom type="box" size="0.02 0.02 0.02" rgba="0.1 0.1 1 1"/>
     </body>
